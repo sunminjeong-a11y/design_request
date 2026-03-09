@@ -206,6 +206,7 @@ export default function App() {
   const [lang, setLang] = useState("ko"); // 'ko' | 'en'
   const t = (ko, en) => lang === "ko" ? ko : en;
 
+
   // ── Auth ────────────────────────────────────────────────────
   useEffect(() => {
     // Check URL hash for OAuth token (after Google redirect)
