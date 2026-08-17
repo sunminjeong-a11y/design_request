@@ -326,6 +326,34 @@ function formatFileSize(b) {
   return (b / (1024 * 1024)).toFixed(1) + " MB";
 }
 
+// ── 첨부파일 업로드 제약 ─────────────────────────────────────
+// Supabase Storage의 객체 키는 ASCII 일부 문자만 허용한다.
+// 한글/특수문자가 든 파일명은 "Invalid key"로 거부되므로,
+// 저장 경로에는 안전하게 변환한 이름을 쓰고 화면에 보이는 이름은 원본을 유지한다.
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // Supabase Free 플랜 상한
+const UPLOAD_RETRIES = 3; // 대용량 파일은 간헐적으로 실패하므로 재시도한다
+
+function safeStorageName(name) {
+  const dot = name.lastIndexOf(".");
+  const ext =
+    dot > 0
+      ? name
+          .slice(dot + 1)
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "")
+          .slice(0, 10)
+      : "";
+  let stem = (dot > 0 ? name.slice(0, dot) : name)
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-._]+|[-._]+$/g, "")
+    .slice(0, 50);
+  if (!stem) stem = "file"; // 한글만으로 된 파일명 등
+  // 이름이 뭉개져 겹칠 수 있으므로 짧은 무작위 접미사로 키를 고유하게 만든다.
+  const rand = Math.random().toString(36).slice(2, 8);
+  return ext ? `${stem}-${rand}.${ext}` : `${stem}-${rand}`;
+}
+
 // ── CSS ──────────────────────────────────────────────────────
 const CSS = `
   *{box-sizing:border-box;margin:0;padding:0;}
@@ -996,49 +1024,108 @@ export default function App() {
   };
 
   // ── File upload ──────────────────────────────────────────
-  const uploadFile = async (file, ticketId) => {
-    const path = `${ticketId}/${Date.now()}_${file.name}`;
-    const res = await fetch(
-      `${SUPABASE_URL}/storage/v1/object/attachments/${path}`,
-      {
-        method: "POST",
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${getToken()}`,
-          "Content-Type": file.type || "application/octet-stream",
-        },
-        body: file,
-      }
-    );
-    if (!res.ok) throw new Error("업로드 실패");
+  // 성공하면 null, 실패하면 { message, retryable }을 돌려준다.
+  const attemptUpload = async (file, path) => {
+    let res;
+    try {
+      res = await fetch(
+        `${SUPABASE_URL}/storage/v1/object/attachments/${path}`,
+        {
+          method: "POST",
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: `Bearer ${getToken()}`,
+            "Content-Type": file.type || "application/octet-stream",
+          },
+          body: file,
+        }
+      );
+    } catch {
+      // 연결 끊김·타임아웃. 대용량 파일에서 주로 발생한다.
+      return { message: "네트워크 오류 (연결 끊김 또는 시간 초과)", retryable: true };
+    }
+    if (res.ok) return null;
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body?.message || body?.error || "";
+    } catch {
+      detail = "";
+    }
     return {
-      name: file.name,
-      url: `${SUPABASE_URL}/storage/v1/object/public/attachments/${path}`,
-      size: file.size,
-      type: file.type,
+      message: detail
+        ? `${res.status} ${detail}`
+        : `업로드 실패 (${res.status})`,
+      // 5xx·429는 일시적인 문제로 보고 재시도한다.
+      // 4xx(용량 초과, 권한 등)는 재시도해도 결과가 같으므로 즉시 중단한다.
+      retryable: res.status >= 500 || res.status === 429,
     };
+  };
+
+  const uploadFile = async (file, ticketId) => {
+    if (file.size > MAX_UPLOAD_BYTES) {
+      throw new Error(
+        `용량 초과 (${formatFileSize(file.size)} / 최대 ${formatFileSize(
+          MAX_UPLOAD_BYTES
+        )})`
+      );
+    }
+    let err = null;
+    for (let attempt = 1; attempt <= UPLOAD_RETRIES; attempt++) {
+      // 이전 시도가 일부만 올라갔을 수 있으므로 시도마다 새 경로를 쓴다.
+      const path = `${ticketId}/${Date.now()}_${safeStorageName(file.name)}`;
+      err = await attemptUpload(file, path);
+      if (!err) {
+        return {
+          name: file.name,
+          url: `${SUPABASE_URL}/storage/v1/object/public/attachments/${path}`,
+          size: file.size,
+          type: file.type,
+        };
+      }
+      if (!err.retryable) break;
+      if (attempt < UPLOAD_RETRIES) {
+        await new Promise((r) => setTimeout(r, 800 * attempt));
+      }
+    }
+    throw new Error(err.message);
   };
 
   const handleFileUpload = async (files, isEdit = false) => {
     if (!files?.length) return;
     setUploading(true);
+    const list = Array.from(files);
+    const uploaded = [];
+    const failed = [];
     try {
       const tempId = isEdit ? editData.id : `TEMP-${Date.now()}`;
-      const uploaded = await Promise.all(
-        Array.from(files).map((f) => uploadFile(f, tempId))
-      );
-      if (isEdit)
-        setEditData((p) => ({
-          ...p,
-          attachments: [...(p.attachments || []), ...uploaded],
-        }));
-      else
-        setFormData((p) => ({
-          ...p,
-          attachments: [...p.attachments, ...uploaded],
-        }));
-    } catch {
-      alert("파일 업로드 중 오류가 발생했습니다.");
+      // 순차 업로드 + 개별 실패 격리:
+      // 한 파일이 실패해도 나머지 성공분은 그대로 첨부된다.
+      for (const f of list) {
+        try {
+          uploaded.push(await uploadFile(f, tempId));
+        } catch (e) {
+          failed.push(`· ${f.name} — ${e?.message || "알 수 없는 오류"}`);
+        }
+      }
+      if (uploaded.length) {
+        if (isEdit)
+          setEditData((p) => ({
+            ...p,
+            attachments: [...(p.attachments || []), ...uploaded],
+          }));
+        else
+          setFormData((p) => ({
+            ...p,
+            attachments: [...p.attachments, ...uploaded],
+          }));
+      }
+      if (failed.length) {
+        alert(
+          `파일 ${list.length}개 중 ${uploaded.length}개가 첨부되었습니다.\n\n` +
+            `실패한 파일:\n${failed.join("\n")}`
+        );
+      }
     } finally {
       setUploading(false);
     }
